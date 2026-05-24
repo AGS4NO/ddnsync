@@ -1,0 +1,18 @@
+# build output
+/ddnsync
+/dist/
+/out/
+
+# local env / secrets
+.env
+.env.*
+!.env.example
+
+# go test/coverage
+*.test
+*.out
+coverage.*
+
+# editors
+.idea/
+*.swp

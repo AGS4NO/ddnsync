@@ -16,6 +16,8 @@ concurrency:
 env:
   GO_VERSION: "1.26.3"
   REGISTRY: ghcr.io
+  # Opt into Node.js 24 for JS actions ahead of the 2026-06-02 forced switch.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   test:
@@ -25,6 +27,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.mod
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
@@ -36,6 +39,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.mod
       - name: Build linux/amd64 binary
         env:
           CGO_ENABLED: "0"

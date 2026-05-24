@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // mockDNSimple implements the slice of the DNSimple v2 API that ddnsync calls,
@@ -51,7 +55,6 @@ func (m *mockDNSimple) handler() http.Handler {
 			http.Error(w, `{"message":"forced failure"}`, http.StatusInternalServerError)
 			return
 		}
-		// Expecting /v2/{account}/zones/{zone}/records[/{id}]
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v2/"+m.account+"/"), "/")
 		if len(parts) < 3 || parts[0] != "zones" || parts[2] != "records" {
 			http.NotFound(w, r)
@@ -114,9 +117,16 @@ func newTestServer(t *testing.T) (*server, *mockDNSimple) {
 		http:    ts.Client(),
 	}
 	s := &server{
-		cfg:   config{user: "u", pass: "p", ttl: 60},
-		dns:   d,
-		zones: []string{"example.com"},
+		cfg: config{
+			user:         "u",
+			pass:         "p",
+			ttl:          60,
+			addr:         ":8245",
+			pollIPSource: "https://api.ipify.org",
+		},
+		dns:      d,
+		zones:    []string{"example.com"},
+		ipClient: &http.Client{Timeout: 5 * time.Second},
 	}
 	return s, m
 }
@@ -132,6 +142,8 @@ func doUpdate(t *testing.T, s *server, query, user, pass string) (int, string) {
 	b, _ := io.ReadAll(w.Body)
 	return w.Code, strings.TrimSpace(string(b))
 }
+
+// ---- handler tests ----
 
 func TestHandleUpdate_BadAuth(t *testing.T) {
 	s, _ := newTestServer(t)
@@ -246,6 +258,8 @@ func TestHandleUpdate_DNSimpleFailure(t *testing.T) {
 	}
 }
 
+// ---- pure-function tests ----
+
 func TestSplitHost(t *testing.T) {
 	s := &server{zones: []string{"example.co.uk", "example.com"}}
 	sortLongestFirst(s.zones)
@@ -307,5 +321,227 @@ func TestClientIP(t *testing.T) {
 			t.Errorf("clientIP(xff=%q, remote=%q) = %q, want %q",
 				c.xff, c.remoteAddr, got, c.want)
 		}
+	}
+}
+
+// ---- poll-mode tests ----
+
+// newIPSource spins up an httptest server that returns a fixed body for the
+// configured IP-discovery URL.
+func newIPSource(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestFetchIP_TrimAndValidate(t *testing.T) {
+	s, _ := newTestServer(t)
+	ip := newIPSource(t, "  9.8.7.6\n")
+	s.cfg.pollIPSource = ip.URL
+	s.ipClient = ip.Client()
+
+	got, err := s.fetchIP(context.Background())
+	if err != nil {
+		t.Fatalf("fetchIP: %v", err)
+	}
+	if got != "9.8.7.6" {
+		t.Fatalf("got %q, want 9.8.7.6", got)
+	}
+}
+
+func TestFetchIP_RejectsGarbage(t *testing.T) {
+	s, _ := newTestServer(t)
+	ip := newIPSource(t, "not-an-ip")
+	s.cfg.pollIPSource = ip.URL
+	s.ipClient = ip.Client()
+
+	if _, err := s.fetchIP(context.Background()); err == nil {
+		t.Fatal("expected error on garbage IP source response")
+	}
+}
+
+func TestPollOnce_UpdatesAllHostnames(t *testing.T) {
+	s, m := newTestServer(t)
+	s.cfg.pollHostnames = []string{"home.example.com", "vpn.example.com"}
+	ip := newIPSource(t, "9.8.7.6")
+	s.cfg.pollIPSource = ip.URL
+	s.ipClient = ip.Client()
+
+	s.pollOnce(context.Background())
+
+	for _, name := range []string{"home", "vpn"} {
+		rec := m.records[m.key("example.com", name, "A")]
+		if rec == nil || rec.Content != "9.8.7.6" {
+			t.Errorf("host %s: record = %+v", name, rec)
+		}
+	}
+}
+
+func TestPollOnce_BadIPSourceDoesNothing(t *testing.T) {
+	s, m := newTestServer(t)
+	s.cfg.pollHostnames = []string{"home.example.com"}
+	ip := newIPSource(t, "garbage")
+	s.cfg.pollIPSource = ip.URL
+	s.ipClient = ip.Client()
+
+	s.pollOnce(context.Background())
+
+	if len(m.records) != 0 {
+		t.Fatalf("expected no records, got %d", len(m.records))
+	}
+}
+
+func TestPollOnce_ContinuesPastBadHost(t *testing.T) {
+	s, m := newTestServer(t)
+	// First host has no matching zone, second one does.
+	s.cfg.pollHostnames = []string{"home.unknown.org", "home.example.com"}
+	ip := newIPSource(t, "1.2.3.4")
+	s.cfg.pollIPSource = ip.URL
+	s.ipClient = ip.Client()
+
+	s.pollOnce(context.Background())
+
+	rec := m.records[m.key("example.com", "home", "A")]
+	if rec == nil || rec.Content != "1.2.3.4" {
+		t.Fatalf("good host should still update: %+v", rec)
+	}
+}
+
+func TestPollLoop_FiresAndStops(t *testing.T) {
+	s, m := newTestServer(t)
+	s.cfg.pollHostnames = []string{"home.example.com"}
+	s.cfg.pollInterval = 50 * time.Millisecond
+
+	var hits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, "1.2.3.4")
+	}))
+	t.Cleanup(ts.Close)
+	s.cfg.pollIPSource = ts.URL
+	s.ipClient = ts.Client()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.pollLoop(ctx)
+		close(done)
+	}()
+
+	// Let the loop tick a couple of times, then cancel and assert it stops.
+	time.Sleep(180 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pollLoop did not exit after context cancel")
+	}
+
+	if hits.Load() < 2 {
+		t.Fatalf("expected at least 2 IP probes, got %d", hits.Load())
+	}
+	if rec := m.records[m.key("example.com", "home", "A")]; rec == nil || rec.Content != "1.2.3.4" {
+		t.Fatalf("record not updated by loop: %+v", rec)
+	}
+}
+
+// ---- config tests ----
+
+func TestLoadConfig_Validation(t *testing.T) {
+	// Clean slate for env vars we touch.
+	keys := []string{
+		"DNSIMPLE_TOKEN", "AUTH_USER", "AUTH_PASS",
+		"LISTEN_ADDR", "DNSIMPLE_API", "RECORD_TTL",
+		"POLL_INTERVAL", "POLL_HOSTNAMES", "POLL_IP_SOURCE",
+	}
+	for _, k := range keys {
+		t.Setenv(k, "")
+	}
+
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr string // substring; "" means must succeed
+	}{
+		{
+			name:    "no token",
+			env:     map[string]string{},
+			wantErr: "DNSIMPLE_TOKEN",
+		},
+		{
+			name: "default server mode requires auth",
+			env: map[string]string{
+				"DNSIMPLE_TOKEN": "tok",
+			},
+			wantErr: "AUTH_USER",
+		},
+		{
+			name: "server mode happy path",
+			env: map[string]string{
+				"DNSIMPLE_TOKEN": "tok",
+				"AUTH_USER":      "u",
+				"AUTH_PASS":      "p",
+			},
+		},
+		{
+			name: "poll-only with listen off",
+			env: map[string]string{
+				"DNSIMPLE_TOKEN": "tok",
+				"LISTEN_ADDR":    "off",
+				"POLL_INTERVAL":  "5m",
+				"POLL_HOSTNAMES": "home.example.com",
+			},
+		},
+		{
+			name: "poll without hostnames",
+			env: map[string]string{
+				"DNSIMPLE_TOKEN": "tok",
+				"LISTEN_ADDR":    "off",
+				"POLL_INTERVAL":  "5m",
+			},
+			wantErr: "POLL_HOSTNAMES",
+		},
+		{
+			name: "everything off",
+			env: map[string]string{
+				"DNSIMPLE_TOKEN": "tok",
+				"LISTEN_ADDR":    "off",
+			},
+			wantErr: "nothing to do",
+		},
+		{
+			name: "poll interval too short",
+			env: map[string]string{
+				"DNSIMPLE_TOKEN": "tok",
+				"LISTEN_ADDR":    "off",
+				"POLL_INTERVAL":  "5s",
+				"POLL_HOSTNAMES": "home.example.com",
+			},
+			wantErr: "too short",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range keys {
+				t.Setenv(k, "")
+			}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := loadConfig()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got err=%v, want substring %q", err, tc.wantErr)
+			}
+		})
 	}
 }
